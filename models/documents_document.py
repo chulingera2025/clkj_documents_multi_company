@@ -36,13 +36,17 @@ class DocumentsDocument(models.Model):
             return False
         
         # 检查是否有XML ID（系统创建的通常有XML ID）
-        data = self.env['ir.model.data'].search([
-            ('model', '=', 'documents.document'),
-            ('res_id', '=', folder.id)
-        ], limit=1)
-        
-        if data:
-            return True
+        try:
+            data = self.env['ir.model.data'].sudo().search([
+                ('model', '=', 'documents.document'),
+                ('res_id', '=', folder.id)
+            ], limit=1)
+            
+            if data:
+                return True
+        except Exception:
+            # 如果访问失败，继续使用其他方法判断
+            pass
         
         # 检查是否是系统默认的文件夹名称
         system_folder_names = ['Inbox', 'Internal', 'Workspace', 'Finance', 'HR', 'Projects']
@@ -95,3 +99,39 @@ class DocumentsDocument(models.Model):
                     child_documents.with_context(skip_company_recompute=True)._compute_company_id()
                     
         return result
+    
+    def _get_permission_without_token(self):
+        """重写权限检查方法，修复共享文件的公司权限问题"""
+        self.ensure_one()
+        is_user_company = self.company_id and self.company_id in self.env.user.company_ids
+        is_disabled_company = is_user_company and self.company_id not in self.env.companies
+        if is_disabled_company:
+            return 'none'
+
+        # own documents
+        if self.owner_id == self.env.user:
+            return 'edit'
+
+        user_permission = 'none'
+        # access with <documents.access>
+        if access := self.access_ids.filtered(
+            lambda a: a.partner_id == self.env.user.partner_id
+            and (not a.expiration_date or a.expiration_date > fields.Datetime.now())
+        ):
+            user_permission = access.role or self.access_via_link
+
+        # access as internal
+        if not self.env.user.share and user_permission != "edit" and self.access_internal != 'none':
+            # 修复：如果用户通过documents.access明确获得了权限，忽略公司限制
+            has_explicit_access = self.access_ids.filtered(
+                lambda a: a.partner_id == self.env.user.partner_id
+                and (not a.expiration_date or a.expiration_date > fields.Datetime.now())
+            )
+            
+            if has_explicit_access or not self.company_id or self.company_id in self.env.companies:
+                user_permission = (
+                    'edit' if self.env.user.has_group('documents.group_documents_manager')
+                    else self.access_internal
+                )
+
+        return user_permission
